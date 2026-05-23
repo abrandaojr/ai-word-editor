@@ -293,7 +293,7 @@ def extract_images_from_paragraph(
             continue
         image_part = doc.part.related_parts[rid]
         original_name = Path(
-            getattr(image_part, "partname", f"image_{counter}.png").basename
+            Path(getattr(getattr(image_part, "partname", None), "filename", f"image_{counter}.png")).name
         ).name
         suffix = Path(original_name).suffix or ".png"
         figure_id = f"figure_{counter:03d}"
@@ -658,7 +658,7 @@ def add_table_to_docx(
 
     tbl = doc.add_table(rows=0, cols=n_cols)
     # Use Plain Table style as base (no pre-existing borders)
-    tbl.style = "Table Normal"
+    # style set via XML borders below
 
     for i, row in enumerate(rows):
         cells = tbl.add_row().cells
