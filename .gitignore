@@ -1,14 +1,15 @@
+# Environment
 .env
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+
+# Outputs (generated files, not source)
 output/
-*.aux
-*.log
-*.out
-*.toc
-*.fls
-*.fdb_latexmk
-*.synctex.gz
-.DS_Store
+
+# Editor and OS
+.vscode/
+.idea/
+*.DS_Store
 Thumbs.db

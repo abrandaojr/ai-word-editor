@@ -1,5 +1,9 @@
-anthropic>=0.72.0
-python-docx>=1.1.2
-python-dotenv>=1.0.1
-reportlab>=4.2.2
-Pillow>=10.4.0
+# Core dependencies
+# Upper bounds protect against breaking changes in major versions.
+anthropic>=0.72.0,<2.0.0
+python-docx>=1.1.2,<2.0.0
+python-dotenv>=1.0.1,<2.0.0
+
+# PDF output (ReportLab fallback when pdflatex is unavailable)
+reportlab>=4.2.2,<5.0.0
+Pillow>=10.4.0,<12.0.0

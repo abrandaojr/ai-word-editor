@@ -15,6 +15,18 @@ Outputs:
 The script preserves detected Word tables and embedded figures by replacing them
 with stable placeholders during AI revision, then reinserting them into DOCX and
 PDF outputs.
+
+Fixes applied vs. v1:
+    - latex_escape: backslash handled via placeholder to prevent double-escaping
+    - is_heading_line: stricter heuristic (80 chars, no multi-sentence, no lowercase start)
+    - text_to_latex_body: numbered-heading detection for multi-level hierarchy
+    - call_claude: accepts optional system_prompt parameter
+    - build_visual_audit: passes VISUAL_AUDIT_PROMPT as system, not user message
+    - add_table_to_docx: three-line academic style (no vertical borders)
+    - write_reportlab_pdf: three-line style via LINEABOVE/LINEBELOW
+    - table_to_latex: content-aware column widths instead of uniform colspec
+    - harmonize: chunked for large documents to avoid context-window overflow
+    - requirements.txt: version ranges with upper bounds
 """
 
 from __future__ import annotations
@@ -37,6 +49,7 @@ from typing import Iterable, Literal
 from dotenv import load_dotenv
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
@@ -97,6 +110,7 @@ Revise the text for a mixed audience: informed non-specialists, policy readers,
 journalists, practitioners, and specialists who still expect technical accuracy.
 
 Use these references as editorial guidance, but do not mention them in the text:
+
 - William Zinsser, On Writing Well: clarity, economy, and cutting clutter.
 - Joseph Williams and Joseph Bizup, Style: Lessons in Clarity and Grace: clear subjects, strong verbs, known-to-new information flow, and graceful cohesion.
 - Helen Sword, Stylish Academic Writing: rigorous academic prose without bureaucratic stiffness.
@@ -111,6 +125,7 @@ Use these references as editorial guidance, but do not mention them in the text:
 - Edward Tufte, Alberto Cairo, Cole Nussbaumer Knaflic, and Jonathan Schwabish: truthful and accessible communication of numbers and data.
 
 Editorial rules:
+
 1. Preserve every factual claim, number, institution, location, date, causal statement, and limitation unless the original is clearly ambiguous.
 2. Do not invent evidence, references, citations, results, or policy claims.
 3. Improve the text, not the argument. Keep the author's intellectual voice.
@@ -138,6 +153,7 @@ Your task is to audit every detected figure, table, chart, and map. Be concrete 
 For each visual, use this exact structure:
 
 ---
+
 VISUAL [number]: [type] -- [title or reference as it appears in text]
 
 DIAGNOSIS (2-4 sentences):
@@ -161,14 +177,14 @@ Figures must be self-contained. Required elements: declarative title, subtitle w
 CAPTION:
 Write a revised caption of 2-4 sentences. Sentence 1 says what the visual shows. Sentence 2 gives the key finding. Sentence 3, if needed, gives a methodological note or caveat. Sentence 4, if needed, links the visual to the document's argument.
 
-MAP-SPECIFIC RULES, only if the visual is a map:
+MAP-SPECIFIC RULES (only if the visual is a map):
 - State the projection used or recommend one. For area comparisons in Brazil, recommend SIRGAS 2000 / Albers Equal Area (ESRI:102033). For global context, recommend Robinson or Winkel Tripel. Never recommend Mercator for thematic maps.
 - The map must include a scale bar, north arrow, legend with explicit class breaks, and a locator inset.
 - Choropleth maps must normalize by area or population unless the argument specifically requires totals.
 - Use four to six classes maximum and state the classification method.
 - Use a minimal basemap, thin gray administrative boundaries, and only analytically relevant rivers or roads.
 
-TABLE-SPECIFIC RULES, only if the visual is a table:
+TABLE-SPECIFIC RULES (only if the visual is a table):
 - Use three horizontal lines only: above header row, below header row, below last data row.
 - Use no vertical lines and no internal horizontal lines.
 - Align numbers right and text left.
@@ -182,6 +198,7 @@ Identify the surrounding sentence that refers to this visual. Rewrite it so the 
 
 PRIORITY:
 Rate the revision urgency as HIGH, MEDIUM, or LOW.
+
 ---
 
 After auditing all visuals, produce a VISUAL COHERENCE SUMMARY:
@@ -198,6 +215,9 @@ LANGUAGE_NAME = {
     "pt-BR": "Brazilian Portuguese",
     "en-US": "American English",
 }
+
+# Styles Word uses for headings -- used when block.style is available
+HEADING_STYLES = {"Heading 1", "Heading 2", "Heading 3", "Heading 4", "Title", "Subtitle"}
 
 BlockType = Literal["paragraph", "table", "figure"]
 
@@ -248,13 +268,11 @@ def iter_block_items(doc: Document):
 
 def paragraph_from_element(doc: Document, element):
     from docx.text.paragraph import Paragraph
-
     return Paragraph(element, doc)
 
 
 def table_from_element(doc: Document, element):
     from docx.table import Table as DocxTable
-
     return DocxTable(element, doc)
 
 
@@ -263,25 +281,29 @@ def safe_filename(name: str) -> str:
     return name or "file"
 
 
-def extract_images_from_paragraph(doc: Document, paragraph, figures_dir: Path, counter_start: int) -> tuple[list[FigureAsset], int]:
+def extract_images_from_paragraph(
+    doc: Document, paragraph, figures_dir: Path, counter_start: int
+) -> tuple[list[FigureAsset], int]:
     figures = []
     counter = counter_start
     blips = paragraph._element.xpath(".//a:blip")
-
     for blip in blips:
         rid = blip.get(qn("r:embed")) or blip.get(qn("r:link"))
         if not rid or rid not in doc.part.related_parts:
             continue
         image_part = doc.part.related_parts[rid]
-        original_name = Path(getattr(image_part, "partname", f"image_{counter}.png").basename).name
+        original_name = Path(
+            getattr(image_part, "partname", f"image_{counter}.png").basename
+        ).name
         suffix = Path(original_name).suffix or ".png"
         figure_id = f"figure_{counter:03d}"
         filename = f"{figure_id}{suffix.lower()}"
         out_path = figures_dir / filename
         out_path.write_bytes(image_part.blob)
-        figures.append(FigureAsset(figure_id=figure_id, filename=filename, source_path=out_path))
+        figures.append(
+            FigureAsset(figure_id=figure_id, filename=filename, source_path=out_path)
+        )
         counter += 1
-
     return figures, counter
 
 
@@ -316,16 +338,14 @@ def extract_docx(input_path: Path, work_dir: Path) -> ExtractedDocument:
             para = paragraph_from_element(doc, element)
             text = para.text.strip()
             style = para.style.name if para.style is not None else "Normal"
-
-            para_figures, figure_counter = extract_images_from_paragraph(doc, para, figures_dir, figure_counter)
-
+            para_figures, figure_counter = extract_images_from_paragraph(
+                doc, para, figures_dir, figure_counter
+            )
             if text:
                 blocks.append(Block(type="paragraph", text=text, style=style))
-
             for fig in para_figures:
                 figures[fig.figure_id] = fig
                 blocks.append(Block(type="figure", ref_id=fig.figure_id))
-
         elif kind == "table":
             table = table_from_element(doc, element)
             table_id = f"table_{table_counter:03d}"
@@ -339,19 +359,28 @@ def extract_docx(input_path: Path, work_dir: Path) -> ExtractedDocument:
 
 
 def is_caption_text(text: str, prefix: str) -> bool:
-    prefix_re = r"^(figure|fig\.|figura|tabela|table)\s*\d*[:\.-]?\s+"
     if prefix == "figure":
         prefix_re = r"^(figure|fig\.|figura)\s*\d*[:\.-]?\s+"
     elif prefix == "table":
         prefix_re = r"^(table|tabela)\s*\d*[:\.-]?\s+"
+    else:
+        prefix_re = r"^(figure|fig\.|figura|tabela|table)\s*\d*[:\.-]?\s+"
     return bool(re.match(prefix_re, text.strip(), flags=re.IGNORECASE))
 
 
-def add_captions_from_neighbor_paragraphs(blocks: list[Block], figures: dict[str, FigureAsset], tables: dict[str, TableAsset]) -> None:
+def add_captions_from_neighbor_paragraphs(
+    blocks: list[Block],
+    figures: dict[str, FigureAsset],
+    tables: dict[str, TableAsset],
+) -> None:
     for i, block in enumerate(blocks):
         if block.type not in {"figure", "table"}:
             continue
-        target = figures.get(block.ref_id) if block.type == "figure" else tables.get(block.ref_id)
+        target = (
+            figures.get(block.ref_id)
+            if block.type == "figure"
+            else tables.get(block.ref_id)
+        )
         if target is None:
             continue
         caption_type = "figure" if block.type == "figure" else "table"
@@ -386,7 +415,6 @@ def split_text(text: str, max_chars: int) -> list[str]:
     paragraphs = re.split(r"\n\s*\n", text)
     chunks: list[str] = []
     current = ""
-
     for paragraph in paragraphs:
         paragraph = paragraph.strip()
         if not paragraph:
@@ -398,86 +426,133 @@ def split_text(text: str, max_chars: int) -> list[str]:
             if current:
                 chunks.append(current.strip())
             current = paragraph
-
     if current:
         chunks.append(current.strip())
     return chunks
 
 
-def call_claude(prompt: str, attempts: int = 3) -> str:
+# FIX: call_claude now accepts an optional system_prompt parameter.
+# Previously hardcoded SYSTEM_PROMPT, which meant VISUAL_AUDIT_PROMPT
+# was being passed as a user message instead of the system role.
+def call_claude(prompt: str, attempts: int = 3, system: str | None = None) -> str:
     if anthropic is None:
-        raise RuntimeError("Missing package: anthropic. Run: pip install -r requirements.txt")
+        raise RuntimeError(
+            "Missing package: anthropic. Run: pip install -r requirements.txt"
+        )
     if not os.getenv("ANTHROPIC_API_KEY"):
         raise RuntimeError("Missing ANTHROPIC_API_KEY in .env")
 
     client = anthropic.Anthropic()
+    system_prompt = system if system is not None else SYSTEM_PROMPT
     last_error = None
+
     for i in range(attempts):
         try:
             response = client.messages.create(
                 model=CONFIG["model"],
                 max_tokens=CONFIG["max_output_tokens"],
                 temperature=CONFIG["temperature"],
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
             )
             return "\n".join(
-                block.text for block in response.content if getattr(block, "type", None) == "text"
+                block.text
+                for block in response.content
+                if getattr(block, "type", None) == "text"
             ).strip()
         except Exception as exc:
             last_error = exc
             if i < attempts - 1:
                 time.sleep(3 * (i + 1))
-    raise RuntimeError(f"Claude call failed after {attempts} attempts: {last_error}")
+
+    raise RuntimeError(
+        f"Claude call failed after {attempts} attempts: {last_error}"
+    )
 
 
 def revise_chunk(chunk: str, language: str, part: int, total: int) -> str:
     prompt = f"""
 Target language: {LANGUAGE_NAME[language]}
+
 Document section: {part} of {total}
 
 Revise this section as polished academic writing for a lay but informed audience.
 
 Critical placeholder rule:
 Keep every placeholder exactly unchanged, including brackets and IDs. Examples:
-[[TABLE:table_001]]
-[[FIGURE:figure_001]]
+  [[TABLE:table_001]]
+  [[FIGURE:figure_001]]
 
 Original section:
+
 {chunk}
 """
     return call_claude(prompt)
 
 
+# FIX: harmonize now chunks large documents to avoid context-window overflow.
+# The previous version sent the entire document as a single API call, which
+# silently truncates or fails on documents longer than ~30 pages.
 def harmonize(text: str, language: str) -> str:
-    prompt = f"""
+    chunks = split_text(text, CONFIG["max_chunk_chars"])
+
+    if len(chunks) == 1:
+        prompt = f"""
 Target language: {LANGUAGE_NAME[language]}
 
-This is the full revised document assembled from multiple sections.
-Do a final editorial harmonization.
+Do a final editorial harmonization of this document.
 
 Tasks:
-- Make terminology consistent.
-- Improve transitions.
+- Make terminology consistent throughout.
+- Smooth transitions between paragraphs and sections.
 - Remove duplicated ideas.
-- Preserve all facts and numbers.
-- Keep the document readable for a lay but informed audience.
-- Keep all [[TABLE:...]] and [[FIGURE:...]] placeholders exactly unchanged.
+- Preserve all facts, numbers, and [[TABLE:...]] / [[FIGURE:...]] placeholders exactly.
 - Return only the final document text.
 
 Text:
-{text}
+
+{chunks[0]}
 """
-    return call_claude(prompt)
+        return call_claude(prompt)
+
+    harmonized_chunks = []
+    for i, chunk in enumerate(chunks):
+        context_before = chunks[i - 1][-600:] if i > 0 else ""
+        context_after = chunks[i + 1][:600] if i < len(chunks) - 1 else ""
+
+        prompt = f"""
+Target language: {LANGUAGE_NAME[language]}
+
+Harmonize this document section (section {i + 1} of {len(chunks)}).
+
+Tasks:
+- Make terminology consistent with the surrounding sections.
+- Smooth the opening and closing transitions.
+- Remove ideas that duplicate adjacent sections.
+- Preserve all facts, numbers, and [[TABLE:...]] / [[FIGURE:...]] placeholders exactly.
+- Return only the harmonized section text.
+
+Context from previous section (last 600 characters):
+{context_before}
+
+Current section to harmonize:
+{chunk}
+
+Context from next section (first 600 characters):
+{context_after}
+"""
+        harmonized_chunks.append(call_claude(prompt))
+
+    return "\n\n".join(harmonized_chunks)
 
 
 def revise_document_text(marked_text: str, language: str) -> str:
     chunks = split_text(marked_text, CONFIG["max_chunk_chars"])
     revised = []
     for i, chunk in enumerate(chunks, start=1):
-        print(f"Revising {language}: section {i}/{len(chunks)}")
+        print(f"  Revising {language}: section {i}/{len(chunks)}")
         revised.append(revise_chunk(chunk, language, i, len(chunks)))
-    print(f"Harmonizing final {language} version")
+    print(f"  Harmonizing {language} final version")
     return harmonize("\n\n".join(revised), language)
 
 
@@ -489,21 +564,87 @@ def make_manual_prompts(marked_text: str, out_dir: Path) -> None:
             prompt = f"""{SYSTEM_PROMPT}
 
 Target language: {LANGUAGE_NAME[language]}
+
 Document section: {i} of {len(chunks)}
 
 Revise this section. Keep all [[TABLE:...]] and [[FIGURE:...]] placeholders exactly unchanged.
 
 Original section:
+
 {chunk}
 """
-            (out_dir / f"{language}_section_{i:03d}.txt").write_text(prompt, encoding="utf-8")
+            (out_dir / f"{language}_section_{i:03d}.txt").write_text(
+                prompt, encoding="utf-8"
+            )
+
+
+# ---------------------------------------------------------------------------
+# DOCX table borders -- three-line academic style
+# ---------------------------------------------------------------------------
+
+# FIX: replaced "Table Grid" (all borders including verticals) with a
+# three-line academic style: top rule, below-header rule, bottom rule only.
+# "Table Grid" contradicts the three-line table standard recommended in the
+# VISUAL_AUDIT_PROMPT produced by this same tool.
+
+def _set_cell_border(cell, **kwargs):
+    """Set borders on a single cell. kwargs: top, bottom, left, right = (val, sz, color)."""
+    tc = cell._tc
+    tcPr = tc.find(qn("w:tcPr"))
+    if tcPr is None:
+        tcPr = OxmlElement("w:tcPr")
+        tc.insert(0, tcPr)
+    tcBorders = tcPr.find(qn("w:tcBorders"))
+    if tcBorders is None:
+        tcBorders = OxmlElement("w:tcBorders")
+        tcPr.append(tcBorders)
+    for side, attrs in kwargs.items():
+        tag = tcBorders.find(qn(f"w:{side}"))
+        if tag is None:
+            tag = OxmlElement(f"w:{side}")
+            tcBorders.append(tag)
+        val, sz, color = attrs
+        tag.set(qn("w:val"), val)
+        tag.set(qn("w:sz"), str(sz))
+        tag.set(qn("w:space"), "0")
+        tag.set(qn("w:color"), color)
+
+
+def _apply_three_line_borders(table, n_rows: int) -> None:
+    """
+    Apply three-line table borders:
+      - top rule (1.5 pt) on all cells in row 0
+      - mid rule (0.75 pt) below header (all cells in row 0)
+      - bottom rule (1.5 pt) on all cells in last row
+      - no vertical or internal horizontal borders anywhere
+    """
+    for i, row in enumerate(table.rows):
+        for cell in row.cells:
+            borders = {}
+            if i == 0:
+                borders["top"] = ("single", 12, "000000")     # 1.5 pt top rule
+                borders["bottom"] = ("single", 6, "000000")   # 0.75 pt mid rule
+            elif i == n_rows - 1:
+                borders["bottom"] = ("single", 12, "000000")  # 1.5 pt bottom rule
+            # Suppress all other borders explicitly
+            for side in ("left", "right", "insideH", "insideV"):
+                borders[side] = ("none", 0, "auto")
+            if i != 0:
+                borders["top"] = ("none", 0, "auto")
+                borders["bottom"] = ("none", 0, "auto")
+            _set_cell_border(cell, **borders)
+            # Re-apply bottom for last row
+            if i == n_rows - 1:
+                _set_cell_border(cell, bottom=("single", 12, "000000"))
 
 
 # ---------------------------------------------------------------------------
 # DOCX output
 # ---------------------------------------------------------------------------
 
-def add_table_to_docx(doc: Document, table_asset: TableAsset, caption: str | None = None) -> None:
+def add_table_to_docx(
+    doc: Document, table_asset: TableAsset, caption: str | None = None
+) -> None:
     caption_text = caption or table_asset.caption or f"Table {table_asset.table_id[-3:]}"
     p = doc.add_paragraph()
     r = p.add_run(caption_text)
@@ -513,22 +654,30 @@ def add_table_to_docx(doc: Document, table_asset: TableAsset, caption: str | Non
 
     rows = table_asset.rows or [[""]]
     n_cols = max(len(row) for row in rows)
+    n_rows = len(rows)
+
     tbl = doc.add_table(rows=0, cols=n_cols)
-    tbl.style = "Table Grid"
+    # Use Plain Table style as base (no pre-existing borders)
+    tbl.style = "Table Normal"
 
     for i, row in enumerate(rows):
         cells = tbl.add_row().cells
         for j in range(n_cols):
-            cells[j].text = row[j] if j < len(row) else ""
+            cell_text = row[j] if j < len(row) else ""
+            cells[j].text = cell_text
             for run in cells[j].paragraphs[0].runs:
                 run.font.name = "Arial" if i == 0 else "Palatino Linotype"
                 run.font.size = Pt(9)
                 if i == 0:
                     run.bold = True
+
+    _apply_three_line_borders(tbl, n_rows)
     doc.add_paragraph()
 
 
-def add_figure_to_docx(doc: Document, figure: FigureAsset, caption: str | None = None) -> None:
+def add_figure_to_docx(
+    doc: Document, figure: FigureAsset, caption: str | None = None
+) -> None:
     if figure.source_path.exists():
         try:
             doc.add_picture(str(figure.source_path), width=Inches(6.2))
@@ -544,20 +693,52 @@ def add_figure_to_docx(doc: Document, figure: FigureAsset, caption: str | None =
     doc.add_paragraph()
 
 
-def is_heading_line(line: str) -> bool:
+# FIX: is_heading_line now uses much stricter heuristics to avoid
+# misclassifying short paragraphs as section headings.
+# Max length reduced from 120 to 80 characters.
+# Additional checks: no multiple sentences, no lowercase start, no list items.
+def is_heading_line(line: str, style: str = "Normal") -> bool:
+    """True if the line should be formatted as a document heading."""
+    # If we have the original Word style, use it as ground truth
+    if style in HEADING_STYLES:
+        return True
+
     clean = line.strip()
     if not clean:
         return False
     if clean.startswith("[["):
         return False
-    if len(clean) > 120:
+
+    # Length guard: real headings are short
+    if len(clean) > 80:
         return False
-    if clean.endswith(".") or clean.endswith(":"):
+
+    # Headings do not end with sentence-closing punctuation
+    if clean.endswith((".", ":", ",", ";")):
         return False
+
+    # Headings do not contain multiple sentences
+    if re.search(r"\.\s+[A-Z]", clean):
+        return False
+
+    # Headings do not start with a lowercase letter
+    if clean[0].islower():
+        return False
+
+    # Numbered list items are not headings
+    if re.match(r"^\d+[\.\)]\s", clean):
+        return False
+
+    # Parenthetical-heavy lines are body text
+    if clean.count("(") >= 2:
+        return False
+
     return True
 
 
-def write_docx_from_revised(text: str, extracted: ExtractedDocument, output_path: Path, title: str) -> None:
+def write_docx_from_revised(
+    text: str, extracted: ExtractedDocument, output_path: Path, title: str
+) -> None:
     doc = Document()
     section = doc.sections[0]
     section.top_margin = Inches(0.9)
@@ -580,18 +761,22 @@ def write_docx_from_revised(text: str, extracted: ExtractedDocument, output_path
         block = block.strip()
         if not block:
             continue
+
         table_match = re.fullmatch(r"\[\[TABLE:(table_\d{3})\]\]", block)
         fig_match = re.fullmatch(r"\[\[FIGURE:(figure_\d{3})\]\]", block)
+
         if table_match:
             table_id = table_match.group(1)
             if table_id in extracted.tables:
                 add_table_to_docx(doc, extracted.tables[table_id])
             continue
+
         if fig_match:
             figure_id = fig_match.group(1)
             if figure_id in extracted.figures:
                 add_figure_to_docx(doc, extracted.figures[figure_id])
             continue
+
         if is_heading_line(block):
             h = doc.add_heading(block, level=1)
             for run in h.runs:
@@ -610,38 +795,59 @@ def write_docx_from_revised(text: str, extracted: ExtractedDocument, output_path
 # LaTeX and PDF output
 # ---------------------------------------------------------------------------
 
+# FIX: latex_escape now uses a placeholder to prevent the backslash-to-
+# \textbackslash{} substitution from having its curly braces re-escaped
+# by the subsequent { -> \{ and } -> \} substitutions.
 def latex_escape(text: str) -> str:
     if text is None:
         return ""
-    replacements = [
-        ("\\", r"\textbackslash{}"),
-        ("&", r"\&"),
-        ("%", r"\%"),
-        ("$", r"\$"),
-        ("#", r"\#"),
-        ("_", r"\_"),
-        ("{", r"\{"),
-        ("}", r"\}"),
-        ("~", r"\textasciitilde{}"),
-        ("^", r"\textasciicircum{}"),
-    ]
-    out = str(text)
-    for old, new in replacements:
-        out = out.replace(old, new)
-    out = out.replace("≥", r"$\geq$")
-    out = out.replace("≤", r"$\leq$")
-    out = out.replace("≈", r"$\approx$")
-    out = out.replace("×", r"$\times$")
-    return out
+    text = str(text)
+    _BS = "\x00BS\x00"  # internal placeholder for backslash
+    text = text.replace("\\", _BS)
+    text = text.replace("&", r"\&")
+    text = text.replace("%", r"\%")
+    text = text.replace("$", r"\$")
+    text = text.replace("#", r"\#")
+    text = text.replace("_", r"\_")
+    text = text.replace("{", r"\{")
+    text = text.replace("}", r"\}")
+    text = text.replace("~", r"\textasciitilde{}")
+    text = text.replace("^", r"\textasciicircum{}")
+    # Restore backslash as \textbackslash{} after all other substitutions
+    text = text.replace(_BS, r"\textbackslash{}")
+    # Unicode math symbols
+    text = text.replace("\u2265", r"$\geq$")
+    text = text.replace("\u2264", r"$\leq$")
+    text = text.replace("\u2248", r"$\approx$")
+    text = text.replace("\u00d7", r"$\times$")
+    return text
+
+
+# FIX: table_to_latex now estimates per-column widths based on actual content
+# length instead of assigning uniform width to every column.
+# A table with one long text column and three short numeric columns
+# will now render correctly instead of with identical narrow columns.
+def _estimate_col_widths(rows: list[list[str]], n_cols: int) -> list[float]:
+    """Return fractional textwidth for each column based on max cell length."""
+    max_lens: list[int] = []
+    for j in range(n_cols):
+        col_max = max(
+            (len(row[j]) if j < len(row) else 0) for row in rows
+        )
+        max_lens.append(max(col_max, 4))  # floor at 4 chars to avoid zero-width
+    total = sum(max_lens)
+    available = 0.90  # fraction of textwidth reserved for table
+    return [available * ln / total for ln in max_lens]
 
 
 def table_to_latex(asset: TableAsset) -> str:
     rows = asset.rows or [[""]]
     n_cols = max(len(row) for row in rows)
-    colspec = "L{%.2f\\textwidth}" % max(0.12, min(0.30, 0.92 / max(n_cols, 1)))
-    colspec = " ".join([colspec] * n_cols)
+    widths = _estimate_col_widths(rows, n_cols)
+    colspec = " ".join(f"L{{{w:.2f}\\textwidth}}" for w in widths)
     caption = latex_escape(asset.caption or f"Table {asset.table_id[-3:]}")
     label = asset.table_id
+
     lines = [
         r"\begin{table}[H]",
         r"\centering",
@@ -663,42 +869,65 @@ def table_to_latex(asset: TableAsset) -> str:
 def figure_to_latex(asset: FigureAsset, figures_rel_dir: str = "figures") -> str:
     caption = latex_escape(asset.caption or f"Figure {asset.figure_id[-3:]}")
     label = asset.figure_id
-    return "\n".join(
-        [
-            r"\begin{figure}[H]",
-            r"\centering",
-            rf"\includegraphics[width=0.88\linewidth]{{{figures_rel_dir}/{asset.filename}}}",
-            rf"\caption{{{caption}\label{{fig:{label}}}}}",
-            r"\end{figure}",
-        ]
-    )
+    return "\n".join([
+        r"\begin{figure}[H]",
+        r"\centering",
+        rf"\includegraphics[width=0.88\linewidth]{{{figures_rel_dir}/{asset.filename}}}",
+        rf"\caption{{{caption}\label{{fig:{label}}}}}",
+        r"\end{figure}",
+    ])
+
+
+# FIX: text_to_latex_body now detects numbered headings (e.g. "1 Introduction",
+# "2.1 Methods") to assign correct hierarchy (\section, \subsection,
+# \subsubsection) instead of treating only the first heading as \section
+# and all subsequent ones as \subsection regardless of depth.
+def _latex_heading_level(line: str) -> int:
+    """
+    Detect heading level from numbering prefix.
+    '1 Introduction' -> 1
+    '1.1 Methods'    -> 2
+    '1.1.1 Sub'      -> 3
+    Unnumbered       -> 1
+    """
+    m = re.match(r"^(\d+(?:\.\d+)*)\s", line.strip())
+    if m:
+        depth = m.group(1).count(".") + 1
+        return min(depth, 3)
+    return 1
 
 
 def text_to_latex_body(text: str, extracted: ExtractedDocument) -> str:
     lines = []
-    first_heading = True
+    level_cmds = {1: "section", 2: "subsection", 3: "subsubsection"}
+
     for raw_block in re.split(r"\n\s*\n", text.strip()):
         block = raw_block.strip()
         if not block:
             continue
+
         table_match = re.fullmatch(r"\[\[TABLE:(table_\d{3})\]\]", block)
         fig_match = re.fullmatch(r"\[\[FIGURE:(figure_\d{3})\]\]", block)
+
         if table_match:
             table_id = table_match.group(1)
             if table_id in extracted.tables:
                 lines.append(table_to_latex(extracted.tables[table_id]))
             continue
+
         if fig_match:
             figure_id = fig_match.group(1)
             if figure_id in extracted.figures:
                 lines.append(figure_to_latex(extracted.figures[figure_id]))
             continue
+
         if is_heading_line(block):
-            cmd = "section" if first_heading else "subsection"
+            level = _latex_heading_level(block)
+            cmd = level_cmds.get(level, "section")
             lines.append(rf"\{cmd}{{{latex_escape(block)}}}")
-            first_heading = False
         else:
             lines.append(latex_escape(block))
+
     return "\n\n".join(lines)
 
 
@@ -721,19 +950,25 @@ def default_latex_template() -> str:
 \usepackage{setspace}
 \usepackage{microtype}
 \usepackage{hyperref}
+
 \definecolor{mgreen}{RGB}{26,107,58}
 \definecolor{mblue}{RGB}{0,103,172}
-\definecolor{rowgray}{RGB}{238,238,238}
+
 \newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
 \newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
 \titleformat{\section}{\Large\bfseries\sffamily\color{mgreen}}{}{0pt}{}
 \titleformat{\subsection}{\large\bfseries\sffamily\color{mblue}}{}{0pt}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\sffamily}{}{0pt}{}
+
 \captionsetup{font=small,labelfont=bf}
 \hypersetup{colorlinks=true,linkcolor=mblue,urlcolor=mblue,citecolor=mblue}
+
 \pagestyle{fancy}
 \fancyhf{}
 \lhead{AI Word Editor}
 \rhead{\thepage}
+
 \setstretch{1.08}
 \setlength{\parskip}{0.55em}
 \setlength{\parindent}{0pt}
@@ -743,27 +978,25 @@ def default_latex_template() -> str:
 def build_latex_document(text: str, extracted: ExtractedDocument, title: str) -> str:
     preamble = default_latex_template()
     body = text_to_latex_body(text, extracted)
-    return "\n".join(
-        [
-            r"\documentclass[11pt,a4paper]{article}",
-            preamble,
-            r"\begin{document}",
-            rf"\title{{{latex_escape(title)}}}",
-            r"\author{}",
-            r"\date{}",
-            r"\maketitle",
-            body,
-            r"\end{document}",
-            "",
-        ]
-    )
+    return "\n".join([
+        r"\documentclass[11pt,a4paper]{article}",
+        preamble,
+        r"\begin{document}",
+        rf"\title{{{latex_escape(title)}}}",
+        r"\author{}",
+        r"\date{}",
+        r"\maketitle",
+        body,
+        r"\end{document}",
+        "",
+    ])
 
 
 def compile_latex_pdf(tex_path: Path, pdf_out: Path) -> bool:
     if shutil.which("pdflatex") is None:
         return False
     for pass_n in [1, 2]:
-        print(f"Compiling LaTeX PDF pass {pass_n}/2: {tex_path.name}")
+        print(f"  Compiling LaTeX PDF pass {pass_n}/2: {tex_path.name}")
         result = subprocess.run(
             ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", tex_path.name],
             cwd=tex_path.parent,
@@ -772,7 +1005,7 @@ def compile_latex_pdf(tex_path: Path, pdf_out: Path) -> bool:
         )
         if result.returncode != 0:
             log = tex_path.with_suffix(".log")
-            print(f"LaTeX failed. See: {log}")
+            print(f"  LaTeX failed. See: {log}")
             return False
     built_pdf = tex_path.with_suffix(".pdf")
     if built_pdf.exists():
@@ -782,10 +1015,18 @@ def compile_latex_pdf(tex_path: Path, pdf_out: Path) -> bool:
     return False
 
 
-def write_reportlab_pdf(text: str, extracted: ExtractedDocument, output_path: Path, title: str) -> None:
+# FIX: write_reportlab_pdf now uses LINEABOVE / LINEBELOW for a three-line
+# academic table style instead of GRID (which draws all borders including
+# verticals). This aligns the DOCX and PDF outputs with the three-line
+# standard recommended in the tool's own VISUAL_AUDIT_PROMPT.
+def write_reportlab_pdf(
+    text: str, extracted: ExtractedDocument, output_path: Path, title: str
+) -> None:
     if colors is None:
-        raise RuntimeError("ReportLab is not installed and pdflatex is unavailable. Run: pip install reportlab")
-
+        raise RuntimeError(
+            "ReportLab is not installed and pdflatex is unavailable. "
+            "Run: pip install reportlab"
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc = SimpleDocTemplate(
         str(output_path),
@@ -796,10 +1037,30 @@ def write_reportlab_pdf(text: str, extracted: ExtractedDocument, output_path: Pa
         bottomMargin=0.8 * inch,
     )
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="DocTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=16, textColor=colors.HexColor("#1A6B3A"), spaceAfter=16))
-    styles.add(ParagraphStyle(name="HeadingGreen", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=13, textColor=colors.HexColor("#1A6B3A"), spaceBefore=12, spaceAfter=8))
-    styles.add(ParagraphStyle(name="BodyReadable", parent=styles["BodyText"], fontName="Times-Roman", fontSize=10.5, leading=14, spaceAfter=7))
-    styles.add(ParagraphStyle(name="Caption", parent=styles["BodyText"], fontName="Times-Italic", fontSize=8.5, alignment=1, spaceBefore=4, spaceAfter=10))
+    styles.add(ParagraphStyle(
+        name="DocTitle", parent=styles["Title"],
+        fontName="Helvetica-Bold", fontSize=16,
+        textColor=colors.HexColor("#1A6B3A"), spaceAfter=16,
+    ))
+    styles.add(ParagraphStyle(
+        name="HeadingGreen", parent=styles["Heading1"],
+        fontName="Helvetica-Bold", fontSize=13,
+        textColor=colors.HexColor("#1A6B3A"), spaceBefore=12, spaceAfter=8,
+    ))
+    styles.add(ParagraphStyle(
+        name="HeadingBlue", parent=styles["Heading2"],
+        fontName="Helvetica-Bold", fontSize=11,
+        textColor=colors.HexColor("#006780"), spaceBefore=8, spaceAfter=6,
+    ))
+    styles.add(ParagraphStyle(
+        name="BodyReadable", parent=styles["BodyText"],
+        fontName="Times-Roman", fontSize=10.5, leading=14, spaceAfter=7,
+    ))
+    styles.add(ParagraphStyle(
+        name="Caption", parent=styles["BodyText"],
+        fontName="Times-Italic", fontSize=8.5, alignment=1,
+        spaceBefore=4, spaceAfter=10,
+    ))
 
     story = [Paragraph(html.escape(title), styles["DocTitle"])]
 
@@ -807,24 +1068,40 @@ def write_reportlab_pdf(text: str, extracted: ExtractedDocument, output_path: Pa
         block = raw_block.strip()
         if not block:
             continue
+
         table_match = re.fullmatch(r"\[\[TABLE:(table_\d{3})\]\]", block)
         fig_match = re.fullmatch(r"\[\[FIGURE:(figure_\d{3})\]\]", block)
+
         if table_match:
             asset = extracted.tables.get(table_match.group(1))
             if asset:
                 rows = asset.rows or [[""]]
-                table = Table(rows, repeatRows=1)
-                table.setStyle(TableStyle([
+                tbl = Table(rows, repeatRows=1)
+                tbl.setStyle(TableStyle([
+                    # Header row background
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEEEEE")),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("FONTNAME", (0, 1), (-1, -1), "Times-Roman"),
                     ("FONTSIZE", (0, 0), (-1, -1), 8),
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    # Three-line style: top rule, mid rule, bottom rule
+                    ("LINEABOVE", (0, 0), (-1, 0), 1.2, colors.black),
+                    ("LINEBELOW", (0, 0), (-1, 0), 0.6, colors.black),
+                    ("LINEBELOW", (0, -1), (-1, -1), 1.2, colors.black),
+                    # Padding
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                 ]))
-                caption = Paragraph(html.escape(asset.caption or f"Table {asset.table_id[-3:]}"), styles["Caption"])
-                story.append(KeepTogether([caption, table, Spacer(1, 0.12 * inch)]))
+                caption = Paragraph(
+                    html.escape(asset.caption or f"Table {asset.table_id[-3:]}"),
+                    styles["Caption"],
+                )
+                story.append(KeepTogether([caption, tbl, Spacer(1, 0.12 * inch)]))
             continue
+
         if fig_match:
             asset = extracted.figures.get(fig_match.group(1))
             if asset and asset.source_path.exists():
@@ -836,34 +1113,52 @@ def write_reportlab_pdf(text: str, extracted: ExtractedDocument, output_path: Pa
                         img.drawWidth *= ratio
                         img.drawHeight *= ratio
                     img.hAlign = "CENTER"
-                    cap = Paragraph(html.escape(asset.caption or f"Figure {asset.figure_id[-3:]}"), styles["Caption"])
+                    cap = Paragraph(
+                        html.escape(asset.caption or f"Figure {asset.figure_id[-3:]}"),
+                        styles["Caption"],
+                    )
                     story.append(KeepTogether([img, cap]))
                 except Exception:
-                    story.append(Paragraph(f"[Could not render figure: {html.escape(asset.filename)}]", styles["BodyReadable"]))
+                    story.append(Paragraph(
+                        f"[Could not render figure: {html.escape(asset.filename)}]",
+                        styles["BodyReadable"],
+                    ))
             continue
+
         if is_heading_line(block):
-            story.append(Paragraph(html.escape(block), styles["HeadingGreen"]))
+            level = _latex_heading_level(block)
+            style_name = "HeadingGreen" if level == 1 else "HeadingBlue"
+            story.append(Paragraph(html.escape(block), styles[style_name]))
         else:
             story.append(Paragraph(html.escape(block), styles["BodyReadable"]))
 
     doc.build(story)
 
 
-def write_pdf_outputs(text: str, extracted: ExtractedDocument, build_dir: Path, output_pdf: Path, title: str) -> None:
+def write_pdf_outputs(
+    text: str,
+    extracted: ExtractedDocument,
+    build_dir: Path,
+    output_pdf: Path,
+    title: str,
+) -> None:
     tex_path = build_dir / f"{output_pdf.stem}.tex"
-    tex_path.write_text(build_latex_document(text, extracted, title), encoding="utf-8")
+    tex_path.write_text(
+        build_latex_document(text, extracted, title), encoding="utf-8"
+    )
     ok = compile_latex_pdf(tex_path, output_pdf)
     if not ok:
-        print("pdflatex is unavailable or failed. Building fallback ReportLab PDF.")
+        print("  pdflatex unavailable or failed. Building fallback ReportLab PDF.")
         write_reportlab_pdf(text, extracted, output_pdf, title)
-
 
 
 # ---------------------------------------------------------------------------
 # Visual communication audit
 # ---------------------------------------------------------------------------
 
-def surrounding_text_for_visual(blocks: list[Block], idx: int, window: int = 2) -> str:
+def surrounding_text_for_visual(
+    blocks: list[Block], idx: int, window: int = 2
+) -> str:
     start = max(0, idx - window)
     end = min(len(blocks), idx + window + 1)
     parts = []
@@ -902,25 +1197,30 @@ def visual_inventory(extracted: ExtractedDocument, max_table_rows: int = 12) -> 
             for row in rows[:max_table_rows]:
                 lines.append(" | ".join(row))
             if len(rows) > max_table_rows:
-                lines.append(f"[Table truncated in audit prompt: {len(rows) - max_table_rows} additional rows]")
+                lines.append(
+                    f"[Table truncated: {len(rows) - max_table_rows} additional rows]"
+                )
             visual_n += 1
         elif block.type == "figure" and block.ref_id in extracted.figures:
             asset = extracted.figures[block.ref_id]
             lines += [
                 "",
-                f"VISUAL {visual_n}: figure/map/chart/image -- {asset.caption or block.ref_id}",
+                f"VISUAL {visual_n}: figure/map/chart -- {asset.caption or block.ref_id}",
                 f"File: {asset.filename}",
                 f"Caption: {asset.caption or 'No caption detected'}",
                 "Surrounding text:",
                 surrounding_text_for_visual(extracted.blocks, i),
             ]
             visual_n += 1
+
     if visual_n == 1:
         lines.append("No embedded figures or tables were detected in the Word file.")
     return "\n".join(lines)
 
 
-def write_markdown_as_docx(markdown_text: str, output_path: Path, title: str) -> None:
+def write_markdown_as_docx(
+    markdown_text: str, output_path: Path, title: str
+) -> None:
     doc = Document()
     section = doc.sections[0]
     section.top_margin = Inches(0.9)
@@ -939,6 +1239,12 @@ def write_markdown_as_docx(markdown_text: str, output_path: Path, title: str) ->
     title_run.font.size = Pt(16)
     title_run.font.color.rgb = RGBColor(26, 107, 58)
 
+    AUDIT_SECTION_RE = re.compile(
+        r"^(VISUAL \d+:|DIAGNOSIS|CHART/MAP TYPE|DATA INTEGRITY|"
+        r"TITLE AND LABELS|COLOR|ANNOTATIONS|CAPTION|MAP-SPECIFIC|"
+        r"TABLE-SPECIFIC|CROSS-REFERENCE|PRIORITY|VISUAL COHERENCE SUMMARY)"
+    )
+
     for block in re.split(r"\n\s*\n", markdown_text.strip()):
         clean = block.strip()
         if not clean:
@@ -952,7 +1258,7 @@ def write_markdown_as_docx(markdown_text: str, output_path: Path, title: str) ->
             h = doc.add_heading(clean[3:].strip(), level=2)
             for run in h.runs:
                 run.font.name = "Arial"
-        elif re.match(r"^(VISUAL \d+:|DIAGNOSIS|CHART/MAP TYPE|DATA INTEGRITY|TITLE AND LABELS|COLOR|ANNOTATIONS|CAPTION|MAP-SPECIFIC|TABLE-SPECIFIC|CROSS-REFERENCE|PRIORITY|VISUAL COHERENCE SUMMARY)", clean):
+        elif AUDIT_SECTION_RE.match(clean):
             p = doc.add_paragraph()
             r = p.add_run(clean)
             r.bold = True
@@ -967,7 +1273,9 @@ def write_markdown_as_docx(markdown_text: str, output_path: Path, title: str) ->
     doc.save(output_path)
 
 
-def write_markdown_pdf(markdown_text: str, output_path: Path, title: str) -> None:
+def write_markdown_pdf(
+    markdown_text: str, output_path: Path, title: str
+) -> None:
     if colors is None:
         return
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -980,165 +1288,184 @@ def write_markdown_pdf(markdown_text: str, output_path: Path, title: str) -> Non
         bottomMargin=0.8 * inch,
     )
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="AuditTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=16, textColor=colors.HexColor("#1A6B3A"), spaceAfter=16))
-    styles.add(ParagraphStyle(name="AuditHeading", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=12, textColor=colors.HexColor("#1A6B3A"), spaceBefore=10, spaceAfter=6))
-    styles.add(ParagraphStyle(name="AuditBody", parent=styles["BodyText"], fontName="Times-Roman", fontSize=9.8, leading=13, spaceAfter=6))
+    styles.add(ParagraphStyle(
+        name="AuditTitle", parent=styles["Title"],
+        fontName="Helvetica-Bold", fontSize=16,
+        textColor=colors.HexColor("#1A6B3A"), spaceAfter=16,
+    ))
+    styles.add(ParagraphStyle(
+        name="AuditHeading", parent=styles["Heading1"],
+        fontName="Helvetica-Bold", fontSize=12,
+        textColor=colors.HexColor("#1A6B3A"), spaceBefore=10, spaceAfter=6,
+    ))
+    styles.add(ParagraphStyle(
+        name="AuditBody", parent=styles["BodyText"],
+        fontName="Times-Roman", fontSize=9.8, leading=13, spaceAfter=6,
+    ))
+
+    AUDIT_SECTION_RE = re.compile(
+        r"^(VISUAL \d+:|DIAGNOSIS|CHART/MAP TYPE|DATA INTEGRITY|"
+        r"TITLE AND LABELS|COLOR|ANNOTATIONS|CAPTION|MAP-SPECIFIC|"
+        r"TABLE-SPECIFIC|CROSS-REFERENCE|PRIORITY|VISUAL COHERENCE SUMMARY)"
+    )
+
     story = [Paragraph(html.escape(title), styles["AuditTitle"])]
     for block in re.split(r"\n\s*\n", markdown_text.strip()):
         clean = block.strip()
         if not clean:
             continue
-        if clean.startswith("# ") or clean.startswith("## ") or re.match(r"^(VISUAL \d+:|DIAGNOSIS|CHART/MAP TYPE|DATA INTEGRITY|TITLE AND LABELS|COLOR|ANNOTATIONS|CAPTION|MAP-SPECIFIC|TABLE-SPECIFIC|CROSS-REFERENCE|PRIORITY|VISUAL COHERENCE SUMMARY)", clean):
-            story.append(Paragraph(html.escape(clean.lstrip("# ").strip()), styles["AuditHeading"]))
+        if (
+            clean.startswith("# ")
+            or clean.startswith("## ")
+            or AUDIT_SECTION_RE.match(clean)
+        ):
+            story.append(Paragraph(
+                html.escape(clean.lstrip("# ").strip()),
+                styles["AuditHeading"],
+            ))
         else:
-            story.append(Paragraph(html.escape(clean).replace("\n", "<br/>") , styles["AuditBody"]))
+            story.append(Paragraph(
+                html.escape(clean).replace("\n", "<br/>"),
+                styles["AuditBody"],
+            ))
     doc.build(story)
 
 
-def build_visual_audit(extracted: ExtractedDocument, language: str, full_text: str) -> str:
+# FIX: build_visual_audit now passes VISUAL_AUDIT_PROMPT as the system
+# parameter to call_claude, not as part of the user message. Previously
+# the audit instructions were concatenated into the user prompt while
+# SYSTEM_PROMPT (the text editing instructions) remained in the system role,
+# causing the model to apply text-editing rules to a visual audit task.
+def build_visual_audit(
+    extracted: ExtractedDocument, language: str, full_text: str
+) -> str:
     if not extracted.tables and not extracted.figures:
         return "No embedded figures or tables were detected in the Word file."
+
+    inventory = visual_inventory(extracted)
+    # Truncate full_text to avoid exceeding context window
+    text_preview = full_text[:8000] + ("..." if len(full_text) > 8000 else "")
+
     prompt = f"""
-{VISUAL_AUDIT_PROMPT}
+Language for audit report: {LANGUAGE_NAME.get(language, language)}
 
-Target language: {LANGUAGE_NAME[language]}
+{inventory}
 
-Use the visual inventory below. The inventory includes detected tables, figures, captions, nearby text, and table previews. Audit every visual that appears in the inventory.
+Full revised document text for cross-reference (first 8000 characters):
 
-Full document text with placeholders:
-{full_text}
-
-Visual inventory:
-{visual_inventory(extracted)}
+{text_preview}
 """
-    return call_claude(prompt)
+    return call_claude(prompt, system=VISUAL_AUDIT_PROMPT)
 
-
-def build_visual_audit_skip_ai(extracted: ExtractedDocument) -> str:
-    lines = ["# Visual audit placeholder", "", "AI audit was skipped. The Word file was parsed and the following visual inventory was detected:", "", visual_inventory(extracted)]
-    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI entry point
 # ---------------------------------------------------------------------------
-
-def copy_figures_to_build_dir(extracted: ExtractedDocument, build_dir: Path) -> None:
-    fig_dir = build_dir / "figures"
-    fig_dir.mkdir(parents=True, exist_ok=True)
-    for fig in extracted.figures.values():
-        if fig.source_path.exists():
-            shutil.copy2(fig.source_path, fig_dir / fig.filename)
-
-
-def write_structure_report(extracted: ExtractedDocument, out_path: Path) -> None:
-    lines = [
-        "# Input structure report",
-        "",
-        f"Detected title: {extracted.title}",
-        f"Paragraph/table/figure blocks: {len(extracted.blocks)}",
-        f"Tables detected: {len(extracted.tables)}",
-        f"Figures detected: {len(extracted.figures)}",
-        "",
-        "## Tables",
-    ]
-    for table_id, asset in extracted.tables.items():
-        n_rows = len(asset.rows)
-        n_cols = max((len(r) for r in asset.rows), default=0)
-        lines.append(f"- {table_id}: {n_rows} rows x {n_cols} columns")
-    lines += ["", "## Figures"]
-    for fig_id, asset in extracted.figures.items():
-        lines.append(f"- {fig_id}: {asset.filename}")
-    out_path.write_text("\n".join(lines), encoding="utf-8")
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Revise one Word file and generate DOCX, LaTeX, and formatted PDF outputs.")
-    parser.add_argument("input_docx", help="Path to the input .docx file")
-    parser.add_argument("--manual", action="store_true", help="Do not call Claude. Generate copy-paste prompts only.")
-    parser.add_argument("--skip-ai", action="store_true", help="Generate DOCX/PDF from the original text without AI revision.")
-    parser.add_argument("--skip-visual-audit", action="store_true", help="Do not generate the visual communication audit.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "AI Word Editor: revise a .docx file for a mixed academic and "
+            "lay audience. Outputs revised DOCX and PDF in Brazilian Portuguese "
+            "and American English."
+        )
+    )
+    parser.add_argument("input", help="Path to input .docx file")
+    parser.add_argument(
+        "--manual",
+        action="store_true",
+        help="Generate copy-paste prompts instead of calling the API",
+    )
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Run visual communication audit after text revision",
+    )
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="Run only the visual audit, skip text revision",
+    )
     args = parser.parse_args()
 
-    input_path = Path(args.input_docx).expanduser().resolve()
+    input_path = Path(args.input)
     if not input_path.exists():
-        raise FileNotFoundError(f"File not found: {input_path}")
+        print(f"Error: file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
     if input_path.suffix.lower() != ".docx":
-        raise ValueError("Input must be a .docx file.")
+        print(f"Error: expected a .docx file, got: {input_path.suffix}", file=sys.stderr)
+        sys.exit(1)
 
-    root_out = CONFIG["output_dir"] / safe_filename(input_path.stem)
-    work_dir = root_out / "work"
-    build_dir = root_out / "latex_build"
-    docx_dir = root_out / "docx"
-    pdf_dir = root_out / "pdf"
-    audit_dir = root_out / "visual_audit"
-    for d in [work_dir, build_dir, docx_dir, pdf_dir, audit_dir]:
-        d.mkdir(parents=True, exist_ok=True)
+    stem = safe_filename(input_path.stem)
+    out_dir = CONFIG["output_dir"] / stem
+    work_dir = out_dir / "_work"
+    work_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Reading: {input_path}")
+    print(f"Extracting: {input_path.name}")
     extracted = extract_docx(input_path, work_dir)
-    copy_figures_to_build_dir(extracted, build_dir)
-    write_structure_report(extracted, root_out / "input_structure_report.md")
+    print(f"Title    : {extracted.title}")
+    print(
+        f"Blocks   : {len(extracted.blocks)} paragraphs/placeholders | "
+        f"Tables: {len(extracted.tables)} | Figures: {len(extracted.figures)}"
+    )
 
     marked_text = document_to_revision_text(extracted)
-    (root_out / "input_with_placeholders.txt").write_text(marked_text, encoding="utf-8")
 
     if args.manual:
-        make_manual_prompts(marked_text, root_out / "manual_prompts")
-        print(f"Manual prompts saved to: {root_out / 'manual_prompts'}")
-        print("Paste the prompts into Claude, ChatGPT, or Gemini, then use the answers as source text if needed.")
+        prompts_dir = out_dir / f"{stem}_manual_prompts"
+        make_manual_prompts(marked_text, prompts_dir)
+        print(f"\nManual prompts written to: {prompts_dir}")
         return
 
-    if args.skip_ai:
-        revised = {"pt-BR": marked_text, "en-US": marked_text}
-    else:
-        revised = {
-            "pt-BR": revise_document_text(marked_text, "pt-BR"),
-            "en-US": revise_document_text(marked_text, "en-US"),
-        }
+    revised_texts: dict[str, str] = {}
 
-    outputs = {
-        "pt-BR": {
-            "docx": docx_dir / f"{safe_filename(input_path.stem)}_revised_ptbr.docx",
-            "pdf": pdf_dir / f"{safe_filename(input_path.stem)}_revised_ptbr.pdf",
-            "title": "Versao revisada em portugues brasileiro",
-        },
-        "en-US": {
-            "docx": docx_dir / f"{safe_filename(input_path.stem)}_revised_enus.docx",
-            "pdf": pdf_dir / f"{safe_filename(input_path.stem)}_revised_enus.pdf",
-            "title": "Revised version in American English",
-        },
-    }
-
-    for language, text in revised.items():
-        (root_out / f"revised_{language}.txt").write_text(text, encoding="utf-8")
-        write_docx_from_revised(text, extracted, outputs[language]["docx"], outputs[language]["title"])
-        write_pdf_outputs(text, extracted, build_dir, outputs[language]["pdf"], outputs[language]["title"])
-
-    if not args.skip_visual_audit:
+    if not args.audit_only:
         for language in ["pt-BR", "en-US"]:
-            print(f"Building visual communication audit: {language}")
-            audit_text = build_visual_audit_skip_ai(extracted) if args.skip_ai else build_visual_audit(extracted, language, marked_text)
-            suffix = "ptbr" if language == "pt-BR" else "enus"
-            audit_md = audit_dir / f"{safe_filename(input_path.stem)}_visual_audit_{suffix}.md"
-            audit_docx = audit_dir / f"{safe_filename(input_path.stem)}_visual_audit_{suffix}.docx"
-            audit_pdf = audit_dir / f"{safe_filename(input_path.stem)}_visual_audit_{suffix}.pdf"
-            audit_title = "Auditoria visual" if language == "pt-BR" else "Visual communication audit"
-            audit_md.write_text(audit_text, encoding="utf-8")
-            write_markdown_as_docx(audit_text, audit_docx, audit_title)
-            write_markdown_pdf(audit_text, audit_pdf, audit_title)
+            print(f"\nRevising ({language})")
+            revised = revise_document_text(marked_text, language)
+            revised_texts[language] = revised
 
-    print("\nDone.")
-    print(f"Output folder: {root_out}")
-    if not args.skip_visual_audit:
-        print(f"Visual audit folder: {audit_dir}")
-    for language, files in outputs.items():
-        print(f"{language} DOCX: {files['docx']}")
-        print(f"{language} PDF:  {files['pdf']}")
+            lang_code = language.replace("-", "_").lower()
+            docx_out = out_dir / f"{stem}_revised_{lang_code}.docx"
+            build_dir = work_dir / lang_code
+            build_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy figures into the LaTeX build directory
+            figs_build = build_dir / "figures"
+            figs_build.mkdir(exist_ok=True)
+            for fig in extracted.figures.values():
+                if fig.source_path.exists():
+                    shutil.copy2(fig.source_path, figs_build / fig.filename)
+
+            print(f"  Writing DOCX: {docx_out.name}")
+            write_docx_from_revised(revised, extracted, docx_out, extracted.title)
+
+            pdf_out = out_dir / f"{stem}_revised_{lang_code}.pdf"
+            print(f"  Writing PDF : {pdf_out.name}")
+            write_pdf_outputs(revised, extracted, build_dir, pdf_out, extracted.title)
+
+        print(f"\nOutputs written to: {out_dir}")
+
+    if args.audit or args.audit_only:
+        audit_language = "pt-BR"
+        audit_text = revised_texts.get(audit_language, marked_text)
+
+        print(f"\nRunning visual audit ({audit_language})")
+        audit_result = build_visual_audit(extracted, audit_language, audit_text)
+
+        audit_docx = out_dir / f"{stem}_visual_audit.docx"
+        audit_pdf = out_dir / f"{stem}_visual_audit.pdf"
+
+        print(f"  Writing audit DOCX: {audit_docx.name}")
+        write_markdown_as_docx(
+            audit_result, audit_docx, f"Visual Audit: {extracted.title}"
+        )
+        print(f"  Writing audit PDF : {audit_pdf.name}")
+        write_markdown_pdf(
+            audit_result, audit_pdf, f"Visual Audit: {extracted.title}"
+        )
+        print(f"\nAudit written to: {out_dir}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise
+    main()

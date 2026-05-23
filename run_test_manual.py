@@ -1,10 +1,20 @@
-from pathlib import Path
+#!/usr/bin/env python3
+"""
+Quick test: generate manual copy-paste prompts from a Word file.
+No API credits required.
+"""
 import subprocess
 import sys
+from pathlib import Path
 
-INPUT_FILE = Path(r"C:\Users\Amintas\Downloads\Desmatamento na Amazônia.docx")
+test_file = Path.home() / "Downloads" / "Desmatamento na Amazônia.docx"
 
-if not INPUT_FILE.exists():
-    raise FileNotFoundError(f"Arquivo não encontrado: {INPUT_FILE}")
+if not test_file.exists():
+    print(f"Test file not found: {test_file}")
+    print("Update the filename in run_test_manual.py to match your test document.")
+    sys.exit(1)
 
-subprocess.run([sys.executable, "ai_word_editor.py", str(INPUT_FILE), "--manual"], check=True)
+subprocess.run(
+    [sys.executable, "ai_word_editor.py", str(test_file), "--manual"],
+    check=True,
+)
