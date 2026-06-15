@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Quick test: generate manual copy-paste prompts from a Word file.
+Quick test: generate manual copy-and-paste prompts from a Word file.
 No API credits required.
 """
 import subprocess

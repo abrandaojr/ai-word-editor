@@ -1,10 +1,17 @@
-from pathlib import Path
+#!/usr/bin/env python3
+"""
+Quick test: generate manual prompts without using API credits.
+"""
 import subprocess
 import sys
+from pathlib import Path
 
-INPUT_FILE = Path(r"C:\Users\Amintas\Downloads\Desmatamento na Amazônia.docx")
+input_file = Path.home() / "Downloads" / "Desmatamento na Amazônia.docx"
 
-if not INPUT_FILE.exists():
-    raise FileNotFoundError(f"Arquivo não encontrado: {INPUT_FILE}")
+if not input_file.exists():
+    raise FileNotFoundError(f"Arquivo não encontrado: {input_file}")
 
-subprocess.run([sys.executable, "ai_word_editor.py", str(INPUT_FILE), "--skip-ai"], check=True)
+subprocess.run(
+    [sys.executable, "ai_word_editor.py", str(input_file), "--manual"],
+    check=True,
+)
